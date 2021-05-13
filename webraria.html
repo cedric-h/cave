@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8"/>
+    <title>webraria</title>
+    <script type="text/javascript">
+function main() {
+const canvas = document.getElementById('game_canvas');
+const ctx = canvas.getContext('2d');
+const WORLD_SCALE = 50.0;
+
+class Vec2 {
+    constructor(x, y) {
+        this.x = x;
+        this.y = y;
+    }
+
+    static zero() { return new Vec2(0, 0); }
+    static repeat(x) { return new Vec2(x, x); }
+
+    to_rot() { return Math.atan2(this.y, this.x) }
+
+    mag2() { return this.x * this.x + this.y * this.y; }
+    mag() { return Math.sqrt(this.mag2()); }
+
+    norm() { 
+        const mag = this.mag();
+        this.x /= mag;
+        this.y /= mag;
+        return this;
+    }
+
+    abs(rhs) { return new Vec2(Math.abs(this.x), Math.abs(this.y)); }
+
+    lerp(rhs, t) {
+        return this.mul_f(1.0 - t).add(rhs.mul_f(t));
+    }
+
+    add(rhs) { return new Vec2(this.x + rhs.x, this.y + rhs.y); }
+    add_f(rhs_f) { return new Vec2(this.x + rhs_f, this.y + rhs_f); }
+    sub(rhs) { return new Vec2(this.x - rhs.x, this.y - rhs.y); }
+    sub_f(rhs_f) { return new Vec2(this.x - rhs_f, this.y - rhs_f); }
+    div(rhs) { return new Vec2(this.x / rhs.x, this.y / rhs.y); }
+    div_f(rhs_f) { return new Vec2(this.x / rhs_f, this.y / rhs_f); }
+    mul(rhs) { return new Vec2(this.x * rhs.x, this.y * rhs.y); }
+    mul_f(rhs_f) { return new Vec2(this.x * rhs_f, this.y * rhs_f); }
+}
+
+function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+resize(); // calling it once to set things up
+window.addEventListener('resize', resize);
+
+const downkeys = {};
+window.addEventListener('keydown', ev => downkeys[ev.key] = true );
+window.addEventListener('keyup',   ev => downkeys[ev.key] = false);
+
+let mouse_pos = Vec2.zero();
+let mouse_down = false;
+window.addEventListener('mousedown', ev => mouse_down = true );
+window.addEventListener('mouseup',   ev => mouse_down = false);
+window.addEventListener('mousemove', ev => {
+    mouse_pos.x = (ev.pageX - canvas.width  / 2.0) / WORLD_SCALE;
+    mouse_pos.y = (ev.pageY - canvas.height / 2.0) / WORLD_SCALE;
+});
+
+const MAP_SIZE = 100;
+const tiles = Object.freeze({
+     VOID: 0,
+    GRASS: 1,
+     DIRT: 2,
+    STONE: 3,
+});
+let map = new (class {
+    constructor() {
+        this.tiles = new Uint8Array(MAP_SIZE*MAP_SIZE);
+        this.light = new Uint8Array(MAP_SIZE*MAP_SIZE);
+        this.old_light = new Uint8Array(MAP_SIZE*MAP_SIZE);
+        for (let x = 0; x < MAP_SIZE; x++) {
+            for (let y = 0; y < MAP_SIZE; y++) {
+                let hor = x / MAP_SIZE * 10.0;
+                let ver = y / MAP_SIZE;
+                let tile = tiles.VOID;
+                if (ver > 0.78 + 0.04 * Math.sin(hor))
+                    tile = tiles.STONE
+                else if (ver > 0.73 + 0.08 * Math.sin(hor))
+                    tile = tiles.DIRT
+                else if (ver > 0.7 + 0.1 * Math.sin(hor))
+                    tile = tiles.GRASS;
+                this.set_tile(x, y, tile);
+            }
+        }
+    }
+    tile_at(x, y) { return this.tiles[x * MAP_SIZE + y] }
+    set_tile(x, y, u) { this.tiles[x * MAP_SIZE + y] = u; }
+    light_at(x, y) {
+        return (this.tile_at(x, y) == tiles.VOID)
+                ? 255
+                : this.light[x * MAP_SIZE + y];
+    }
+    set_light(x, y, u) { this.light[x * MAP_SIZE + y] = u; }
+    set_old_light(x, y, u) { this.old_light[x * MAP_SIZE + y] = u; }
+
+    update_light() {
+        for (let x = 0; x < MAP_SIZE; x++) {
+            for (let y = 0; y < MAP_SIZE; y++) {
+                let tile = this.tile_at(x, y);
+                if (tile == tiles.VOID) continue;
+
+                let light = 0;
+                light += this.light_at(x + 1, y + 0) * 0.258;
+                light += this.light_at(x + 0, y + 1) * 0.258;
+                light += this.light_at(x - 1, y - 0) * 0.258;
+                light += this.light_at(x - 0, y - 1) * 0.258;
+
+                light = Math.max(0, light - 5);
+                this.set_old_light(x, y, Math.min(255, light));
+            }
+        }
+        this.light.set(this.old_light);
+    }
+})();
+
+function box_sdf(p, b) {
+    let d = p.abs().sub(b);
+    let q = (new Vec2(Math.max(d.x, 0), Math.max(d.y, 0))).mag();
+    return q + Math.min(Math.max(d.x, d.y), 0.0);
+}
+
+function box_sdf_norm(p, d) {
+    let eps = 0.0002;
+    return new Vec2(
+        0.0 + box_sdf(p.add(new Vec2(eps, 0.0)), d)
+            - box_sdf(p.sub(new Vec2(eps, 0.0)), d),
+        0.0 + box_sdf(p.add(new Vec2(0.0, eps)), d)
+            - box_sdf(p.sub(new Vec2(0.0, eps)), d)
+    ).norm();
+}
+
+let player_pos = Vec2.zero();
+let player_vel = Vec2.zero();
+let player_mining_tile = Vec2.zero();
+let player_mining_timer = 0;
+let player_swing_timer = 0;
+let player_jump_cooldown = 0;
+let player_ground_cooldown = 0;
+function tick_update() {
+    if (mouse_down) {
+        player_swing_timer = Math.min(5, player_swing_timer + 1);
+        if (player_swing_timer == 5) {
+            player_mining_timer++;
+            if (player_mining_timer > 13) {
+                map.set_tile(player_mining_tile.x,
+                             player_mining_tile.y,
+                             tiles.VOID);
+                player_mining_timer = 0;
+            }
+        }
+    } else {
+        player_mining_timer = 0;
+        player_swing_timer = Math.max(0, player_swing_timer - 1);
+    }
+        
+    let move = Vec2.zero();
+    if (downkeys['a']) move.x -= 1.0;
+    if (downkeys['d']) move.x += 1.0;
+    if (move.mag2() > 0.0)
+        player_vel = player_vel.add(move.norm().mul_f(0.073));
+    
+    let push = Vec2.zero();
+    let touched_tile = false;
+    for (let x = 0; x < MAP_SIZE; x++) {
+        for (let y = 0; y < MAP_SIZE; y++) {
+            if (map.tile_at(x, y) == tiles.VOID) continue;
+
+            let p = (new Vec2(x + 0.5, y + 0.5))
+                      .sub_f(MAP_SIZE / 2)
+                      .mul_f(0.3);
+            let b = Vec2.repeat(0.15);
+
+            if (box_sdf(p.sub(mouse_pos).sub(cam_pos), b) < 0.0) {
+                if (player_mining_tile.x != x || player_mining_tile.y != y)
+                    player_mining_timer = 0;
+                player_mining_tile = new Vec2(x, y);
+            }
+
+            p = p.sub(player_pos);
+            let depth = box_sdf(p, b);
+            if (depth < 0.5) {
+                if (!touched_tile) {
+                    if (p.y > 0.0) {
+                        player_ground_cooldown = Math.min(0, player_ground_cooldown - 1);
+                        touched_tile = true;
+                    } else {
+                        player_jump_cooldown += 5;
+                    }
+                }
+                depth -= 0.5;
+                push = push.add(box_sdf_norm(p, b).mul_f(-depth));
+            }
+        }
+    }
+    if (!touched_tile) player_ground_cooldown = Math.max(0, player_ground_cooldown + 1);
+    player_vel = player_vel.sub(push);
+    player_vel.y += 0.03 + 0.1 * Math.max(0.0, Math.min(1.0, (player_ground_cooldown - 10) / 100));
+
+    player_jump_cooldown++;
+    if (player_ground_cooldown < -15) {
+        if (downkeys[' ']) {
+            player_jump_cooldown = 0;
+        }
+    }
+    if (player_jump_cooldown < 50) {
+        player_vel.y -= 0.12 * (1.0 - (player_jump_cooldown / 50.0));
+    }
+
+    player_vel = player_vel.mul_f(0.65); // friction constant
+    player_pos = player_pos.add(player_vel);
+}
+
+let last_frame, tick = 0, time_bank = 0;
+let cam_pos = Vec2.zero();
+function frame(timestamp) {
+    if (last_frame === undefined)
+        last_frame = timestamp;
+        
+    time_bank += timestamp - last_frame;
+    while (time_bank > (1000.0 / 60.0)) {
+        time_bank -= 1000.0 / 60.0;
+        tick++;
+        tick_update();
+        map.update_light();
+        cam_pos = cam_pos.lerp(player_pos, 0.05);
+    }
+    last_frame = timestamp;
+
+    ctx.save();
+    ctx.fillStyle = 'skyBlue';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.translate(canvas.width / 2.0, canvas.height / 2.0);
+    ctx.scale(WORLD_SCALE, WORLD_SCALE);
+
+    ctx.translate(-cam_pos.x, -cam_pos.y);
+    for (let x = 0; x < MAP_SIZE; x++) {
+        for (let y = 0; y < MAP_SIZE; y++) {
+            let tile = map.tile_at(x, y);
+            if (tile == tiles.VOID) continue;
+            else if (tile == tiles.GRASS) ctx.fillStyle = 'green';
+            else if (tile == tiles.DIRT)  ctx.fillStyle = 'saddlebrown';
+            else if (tile == tiles.STONE) ctx.fillStyle = 'grey';
+
+            ctx.globalAlpha = map.light_at(x, y) / 255.0;
+
+            let size = 0.3;
+            if (player_mining_tile.x == x && player_mining_tile.y == y) {
+                size = size * (1.0 - player_mining_timer / 20.0);
+            }
+            
+            let hor = x - MAP_SIZE / 2;
+            let ver = y - MAP_SIZE / 2;
+            let shrink = (0.3 - size) / 2.0;
+            ctx.fillRect(shrink + 0.3 * hor, shrink + 0.3 * ver, size, size);
+        }
+    }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = 'black';
+
+    ctx.translate(player_pos.x, player_pos.y);
+    ctx.fillRect(-0.5, -0.65, 1, 1.2);
+    ctx.fillStyle = 'burlyWood';
+    ctx.rotate(mouse_pos.to_rot() + 0.5 * player_swing_timer / 5.0 * Math.sin(tick * 0.4));
+    ctx.fillRect(-0.4, -0.1, 1.2, 0.2);
+    ctx.fillStyle = 'darkGrey';
+    ctx.fillRect(1.2 - 0.65, -0.5, 0.18, 1.0);
+    ctx.restore();
+
+    // trigger the next frame
+    requestAnimationFrame(frame);
+}
+// kickstart frame
+requestAnimationFrame(frame);
+
+}
+    </script>
+    <style type="text/css">
+      html, body { overflow: hidden; }
+      canvas, html, body { margin: 0px; border: 0px; }
+    </style>
+  </head>
+  <body onload="main();">
+    <canvas id="game_canvas"></canvas>
+  </body>
+</html>
